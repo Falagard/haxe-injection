@@ -115,6 +115,23 @@ final class ServiceProvider implements Destructable implements Service {
 		return this;
 	}
 
+	/**
+		Create a new child scope on the provider.
+		Singletons are shared from the parent, but scoped services are isolated.
+	**/
+	public function createChildScope():ServiceProvider {
+		var instances = new StringMap<Service>();
+		// Share all singletons that have already been resolved
+		for (name in _resolvedSingletonOrder) {
+			instances.set(name, _resolvedSingletons.get(name));
+		}
+		// Also share any specifically requested instances
+		for (name in _requestedInstances.keys()) {
+			instances.set(name, _requestedInstances.get(name));
+		}
+		return new ServiceProvider(_requestedConfigs, _requestedServices, instances);
+	}
+
 	private function handleServiceRequest(name : String, serviceType:InternalServiceType):Service {
 		switch (serviceType) {
 			case Singleton(implementation):
@@ -276,7 +293,7 @@ final class ServiceProvider implements Destructable implements Service {
 
 	private function destroyScopes() : Void {
 		for(key in _resolvedScopeOrder) {
-			var scope = _resolvedSingletons.get(key);
+			var scope = _resolvedScopes.get(key);
 			if(Std.isOfType(scope, Destructable)) {
 				cast(scope, Destructable).destroy();
 			}
