@@ -3,6 +3,9 @@ package hx.injection;
 import hx.injection.generics.GenericDefinition;
 import hx.injection.Destructable;
 import haxe.ds.StringMap;
+#if sys
+import sys.thread.Mutex;
+#end
 
 final class ServiceProvider implements Destructable implements Service {
 
@@ -16,6 +19,10 @@ final class ServiceProvider implements Destructable implements Service {
 	private var _resolvedScopeOrder : Array<String>;
 	private var _resolvedScopes : StringMap<Service>;
 
+	#if sys
+	private var _mutex : Mutex;
+	#end
+
 	public function new(configs : StringMap<Any>, services : StringMap<ServiceGroup>, instances : StringMap<Service>) {
 		_requestedConfigs = configs;
 		_requestedServices = services;
@@ -26,6 +33,10 @@ final class ServiceProvider implements Destructable implements Service {
 		
 		_resolvedScopeOrder = new Array();
 		_resolvedScopes = new StringMap();
+
+		#if sys
+		_mutex = new Mutex();
+		#end
 
 		registerSelf();
 	}
@@ -120,27 +131,55 @@ final class ServiceProvider implements Destructable implements Service {
 		Singletons are shared from the parent, but scoped services are isolated.
 	**/
 	public function createChildScope():ServiceProvider {
-		var instances = new StringMap<Service>();
-		// Share all singletons that have already been resolved
-		for (name in _resolvedSingletonOrder) {
-			instances.set(name, _resolvedSingletons.get(name));
+		#if sys
+		_mutex.acquire();
+		#end
+		try {
+			var instances = new StringMap<Service>();
+			// Share all singletons that have already been resolved
+			for (name in _resolvedSingletonOrder) {
+				instances.set(name, _resolvedSingletons.get(name));
+			}
+			// Also share any specifically requested instances
+			for (name in _requestedInstances.keys()) {
+				instances.set(name, _requestedInstances.get(name));
+			}
+			#if sys
+			_mutex.release();
+			#end
+			return new ServiceProvider(_requestedConfigs, _requestedServices, instances);
+		} catch (e:Dynamic) {
+			#if sys
+			_mutex.release();
+			#end
+			throw e;
 		}
-		// Also share any specifically requested instances
-		for (name in _requestedInstances.keys()) {
-			instances.set(name, _requestedInstances.get(name));
-		}
-		return new ServiceProvider(_requestedConfigs, _requestedServices, instances);
 	}
 
 	private function handleServiceRequest(name : String, serviceType:InternalServiceType):Service {
-		switch (serviceType) {
-			case Singleton(implementation):
-				return handleSingletonService(name, implementation);
-			case Transient(implementation):
-				return handleTransientService(name, implementation);
-			case Scoped(implementation):
-				return handleScopedService(name, implementation);
-			default:
+		#if sys
+		_mutex.acquire();
+		#end
+		try {
+			var instance = switch (serviceType) {
+				case Singleton(implementation):
+					handleSingletonService(name, implementation);
+				case Transient(implementation):
+					handleTransientService(name, implementation);
+				case Scoped(implementation):
+					handleScopedService(name, implementation);
+				default:
+					null;
+			};
+			#if sys
+			_mutex.release();
+			#end
+			return instance;
+		} catch (e:Dynamic) {
+			#if sys
+			_mutex.release();
+			#end
+			throw e;
 		}
 	}
 
@@ -242,16 +281,38 @@ final class ServiceProvider implements Destructable implements Service {
 
 	private function getServiceArgs(service:String) : Array<String> {
 		var type = Type.resolveClass(service);
+		if (type == null) throw new haxe.Exception('Cannot resolve ${service} into a class.');
 		var instance = Type.createEmptyInstance(type);
-		return (instance.getConstructorArgs() : Array<String>);
+		if (instance == null) throw new haxe.Exception('Cannot create empty instance of ${service}.');
+		
+		try {
+			// This relies on macro-generated metadata or method
+			return (instance.getConstructorArgs() : Array<String>);
+		} catch (e:Dynamic) {
+			return []; // Fallback if no args are defined/meta missing
+		}
 	}
 
 	private function getSingleton(serviceName:String):Service {
-		return _resolvedSingletons.get(serviceName);
+		#if sys
+		_mutex.acquire();
+		#end
+		var s = _resolvedSingletons.get(serviceName);
+		#if sys
+		_mutex.release();
+		#end
+		return s;
 	}
 
 	private function getScoped(serviceName:String):Service {
-		return _resolvedScopes.get(serviceName);
+		#if sys
+		_mutex.acquire();
+		#end
+		var s = _resolvedScopes.get(serviceName);
+		#if sys
+		_mutex.release();
+		#end
+		return s;
 	}
 
 	private function getRequestedConfig(config:String):Any {
@@ -273,6 +334,9 @@ final class ServiceProvider implements Destructable implements Service {
 	}
 
 	public function destroy() : Void {
+		#if sys
+		_mutex.acquire();
+		#end
 		destroyScopes();
 		destroySingletons();
 
@@ -280,6 +344,9 @@ final class ServiceProvider implements Destructable implements Service {
 		_requestedServices = null;
 		_resolvedSingletons = null;
 		_resolvedScopes = null;
+		#if sys
+		_mutex.release();
+		#end
 	}
 
 	private function destroySingletons() : Void {
