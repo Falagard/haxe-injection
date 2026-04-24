@@ -21,6 +21,8 @@ final class ServiceProvider implements Destructable implements Service {
 
 	#if sys
 	private var _mutex : Mutex;
+	private var _lockOwner : Null<sys.thread.Thread> = null;
+	private var _lockCount : Int = 0;
 	#end
 
 	public function new(configs : StringMap<Any>, services : StringMap<ServiceGroup>, instances : StringMap<Service>) {
@@ -82,16 +84,24 @@ final class ServiceProvider implements Destructable implements Service {
 			return (cast instance);
 
 		var requestedGroup = _requestedServices.get(serviceName);
+		if (requestedGroup == null) {
+			throw new haxe.Exception('Service of type \'${serviceName}\' not found in requested services map.');
+		}
+
 		var requestedService = null;
 		switch(binding) {
 			case null:
-				requestedService = requestedGroup.getServices()[0];
+				var services = requestedGroup.getServices();
+				if (services == null || services.length == 0) {
+					throw new haxe.Exception('Service of type \'${serviceName}\' has no registered implementations.');
+				}
+				requestedService = services[0];
 			default:
 				requestedService = requestedGroup.getServiceAtKey(Type.getClassName(binding));
 		}
 		
 		if (requestedService == null) {
-			throw new haxe.Exception('Service of type \'${serviceName}\' not found.');
+			throw new haxe.Exception('Service implementation for \'${serviceName}\' (binding: ${binding}) not found.');
 		}
 
 		var implementation = handleServiceRequest(serviceName, requestedService);
@@ -157,8 +167,27 @@ final class ServiceProvider implements Destructable implements Service {
 	}
 
 	private function handleServiceRequest(name : String, serviceType:InternalServiceType):Service {
+		if (serviceType == null) {
+			throw new haxe.Exception('Cannot handle service request for \'${name}\' with null serviceType.');
+		}
+
 		#if sys
-		_mutex.acquire();
+		var self = sys.thread.Thread.current();
+		var isOwner = false;
+		
+		// This check is slightly racey but safe because only the owner can decrement/clear
+		// and we are about to acquire the mutex if we aren't the owner.
+		if (_lockOwner == self) {
+			isOwner = true;
+		}
+
+		if (isOwner) {
+			_lockCount++;
+		} else {
+			_mutex.acquire();
+			_lockOwner = self;
+			_lockCount = 1;
+		}
 		#end
 		try {
 			var instance = switch (serviceType) {
@@ -172,13 +201,27 @@ final class ServiceProvider implements Destructable implements Service {
 					null;
 			};
 			#if sys
-			_mutex.release();
+			_lockCount--;
+			if (_lockCount == 0) {
+				_lockOwner = null;
+				_mutex.release();
+			}
 			#end
 			return instance;
 		} catch (e:Dynamic) {
 			#if sys
-			_mutex.release();
+			_lockCount--;
+			if (_lockCount == 0 || !isOwner) {
+				_lockOwner = null;
+				try { _mutex.release(); } catch(_) {}
+			}
 			#end
+			
+			// Log the error before rethrowing to help debug "Null access" errors
+			var errStr = Std.string(e);
+			if (errStr == "Null access") {
+				throw new haxe.Exception('Null access detected during resolution of service \'${name}\'. This often means a constructor failed or a dependency implementation is missing.');
+			}
 			throw e;
 		}
 	}
@@ -211,6 +254,7 @@ final class ServiceProvider implements Destructable implements Service {
 		var dependencies : Array<Dynamic> = [];
 		var args = getServiceArgs(service);
 		for (arg in args) {
+			trace('[DI] Resolving dependency "$arg" for service "$service" (requested by "$name")');
 			var reg = ~/Iterable\((.+)\)/;
 			var matched = reg.match(arg);
 			switch (matched) {
@@ -240,10 +284,15 @@ final class ServiceProvider implements Destructable implements Service {
 					}
 					
 					if (serviceType != null) {
-						var serviceInstance = handleServiceRequest(name, serviceType);
-						checkLifetimeInjection(name, serviceType);
-						dependencies.push(serviceInstance);
-						continue;
+						try {
+							var serviceInstance = handleServiceRequest(name, serviceType);
+							checkLifetimeInjection(name, serviceType);
+							dependencies.push(serviceInstance);
+							continue;
+						} catch (e:Dynamic) {
+							trace('[DI] Failed to resolve "$arg" for "$service": ' + e);
+							throw e;
+						}
 					}
 				}
 
