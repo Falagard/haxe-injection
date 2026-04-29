@@ -21,8 +21,10 @@ final class ServiceProvider implements Destructable implements Service {
 
 	#if sys
 	private var _mutex : Mutex;
+	private var _condition : sys.thread.Condition;
 	private var _lockOwner : Null<sys.thread.Thread> = null;
 	private var _lockCount : Int = 0;
+	private var _resolving : StringMap<sys.thread.Thread>;
 	#end
 
 	public function new(configs : StringMap<Any>, services : StringMap<ServiceGroup>, instances : StringMap<Service>) {
@@ -38,6 +40,8 @@ final class ServiceProvider implements Destructable implements Service {
 
 		#if sys
 		_mutex = new Mutex();
+		_condition = new sys.thread.Condition();
+		_resolving = new StringMap();
 		#end
 
 		registerSelf();
@@ -173,60 +177,103 @@ final class ServiceProvider implements Destructable implements Service {
 
 		#if sys
 		var self = sys.thread.Thread.current();
-		var isOwner = false;
 		
-		// This check is slightly racey but safe because only the owner can decrement/clear
-		// and we are about to acquire the mutex if we aren't the owner.
-		if (_lockOwner == self) {
-			isOwner = true;
-		}
+		_mutex.acquire();
+		while (true) {
+			var implementation = switch (serviceType) {
+				case Singleton(impl): impl;
+				case Transient(impl): impl;
+				case Scoped(impl): impl;
+			}
 
-		if (isOwner) {
-			_lockCount++;
-		} else {
-			_mutex.acquire();
-			_lockOwner = self;
-			_lockCount = 1;
+			// If it's a singleton or scoped, it might already be resolved
+			var existing = switch (serviceType) {
+				case Singleton(impl): _resolvedSingletons.get(impl);
+				case Scoped(impl): _resolvedScopes.get(impl);
+				default: null;
+			}
+			if (existing != null) {
+				_mutex.release();
+				return existing;
+			}
+
+			// Check if it's currently being resolved by another thread
+			var resolver = _resolving.get(implementation);
+			if (resolver != null && resolver != self) {
+				// Wait for it to finish (avoiding deadlocks by releasing mutex and sleeping)
+				_mutex.release();
+				Sys.sleep(0.01);
+				_mutex.acquire();
+				continue;
+			}
+			
+			// If we are already resolving it, we have a circular dependency (forbidden for constructor injection)
+			if (resolver == self) {
+				_mutex.release();
+				throw new haxe.Exception('Circular dependency detected during resolution of service \'${name}\' (Implementation: ${implementation}).');
+			}
+
+			// Start resolving
+			_resolving.set(implementation, self);
+			_mutex.release();
+			
+			try {
+				var instance = switch (serviceType) {
+					case Singleton(impl):
+						var inst = buildDependencyTree(name, impl);
+						_mutex.acquire();
+						_resolvedSingletonOrder.insert(0, impl);
+						_resolvedSingletons.set(impl, inst);
+						_mutex.release();
+						inst;
+					case Transient(impl):
+						buildDependencyTree(name, impl);
+					case Scoped(impl):
+						var inst = buildDependencyTree(name, impl);
+						_mutex.acquire();
+						_resolvedScopeOrder.insert(0, impl);
+						_resolvedScopes.set(impl, inst);
+						_mutex.release();
+						inst;
+					default: null;
+				};
+
+				_mutex.acquire();
+				_resolving.remove(implementation);
+				_condition.signal();
+				_mutex.release();
+				
+				return instance;
+			} catch (e:Dynamic) {
+				_mutex.acquire();
+				_resolving.remove(implementation);
+				_condition.signal();
+				_mutex.release();
+				
+				var errStr = Std.string(e);
+				if (errStr == "Null access") {
+					throw new haxe.Exception('Null access detected during resolution of service \'${name}\'. This often means a constructor failed or a dependency implementation is missing.');
+				}
+				throw e;
+			}
+		}
+		#else
+		// Non-sys implementation (synchronous, no mutex)
+		return switch (serviceType) {
+			case Singleton(implementation):
+				handleSingletonService(name, implementation);
+			case Transient(implementation):
+				handleTransientService(name, implementation);
+			case Scoped(implementation):
+				handleScopedService(name, implementation);
+			default:
+				null;
 		}
 		#end
-		try {
-			var instance = switch (serviceType) {
-				case Singleton(implementation):
-					handleSingletonService(name, implementation);
-				case Transient(implementation):
-					handleTransientService(name, implementation);
-				case Scoped(implementation):
-					handleScopedService(name, implementation);
-				default:
-					null;
-			};
-			#if sys
-			_lockCount--;
-			if (_lockCount == 0) {
-				_lockOwner = null;
-				_mutex.release();
-			}
-			#end
-			return instance;
-		} catch (e:Dynamic) {
-			#if sys
-			_lockCount--;
-			if (_lockCount == 0 || !isOwner) {
-				_lockOwner = null;
-				try { _mutex.release(); } catch(_) {}
-			}
-			#end
-			
-			// Log the error before rethrowing to help debug "Null access" errors
-			var errStr = Std.string(e);
-			if (errStr == "Null access") {
-				throw new haxe.Exception('Null access detected during resolution of service \'${name}\'. This often means a constructor failed or a dependency implementation is missing.');
-			}
-			throw e;
-		}
 	}
 
 	private function handleSingletonService(name : String, implementation:String):Service {
+
 		var instance = getSingleton(implementation);
 		if (instance == null) {
 			instance = buildDependencyTree(name, implementation);
@@ -254,7 +301,7 @@ final class ServiceProvider implements Destructable implements Service {
 		var dependencies : Array<Dynamic> = [];
 		var args = getServiceArgs(service);
 		for (arg in args) {
-			trace('[DI] Resolving dependency "$arg" for service "$service" (requested by "$name")');
+			// trace('[DI] Resolving dependency "$arg" for service "$service" (requested by "$name")');
 			var reg = ~/Iterable\((.+)\)/;
 			var matched = reg.match(arg);
 			switch (matched) {
