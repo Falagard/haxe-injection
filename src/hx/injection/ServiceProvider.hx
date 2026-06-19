@@ -319,7 +319,9 @@ final class ServiceProvider implements Destructable implements Service {
 						continue;
 					}
 				case false:
+					#if hl hl.Gc.enable(false); #end
 					var binding = arg.split('|');
+					#if hl hl.Gc.enable(true); #end
 					var serviceType = null;
 					switch(binding.length) {
 						case 2:
