@@ -380,7 +380,9 @@ final class ServiceProvider implements Destructable implements Service {
 	private function getServiceArgs(service:String) : Array<String> {
 		var type = Type.resolveClass(service);
 		if (type == null) throw new haxe.Exception('Cannot resolve ${service} into a class.');
+		#if hl hl.Gc.enable(false); #end
 		var instance = Type.createEmptyInstance(type);
+		#if hl hl.Gc.enable(true); #end
 		if (instance == null) throw new haxe.Exception('Cannot create empty instance of ${service}.');
 		
 		try {
