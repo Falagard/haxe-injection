@@ -429,7 +429,7 @@ final class ServiceProvider implements Destructable implements Service {
 
 	private function getBoundService(serviceName:String, key : String):InternalServiceType {
 		var requested = _requestedServices.get(serviceName);
-		
+		if (requested == null) return null;
 		return requested.getServiceAtKey(key);
 	}
 
