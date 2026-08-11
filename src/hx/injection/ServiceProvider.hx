@@ -355,8 +355,17 @@ final class ServiceProvider implements Destructable implements Service {
 		}
 
 		var cl = Type.resolveClass(service);
-		if(cl != null) 
-			return Type.createInstance(cl, dependencies);
+		if(cl != null) {
+			#if hl hl.Gc.enable(false); #end
+			try {
+				var instance = Type.createInstance(cl, dependencies);
+				#if hl hl.Gc.enable(true); #end
+				return instance;
+			} catch (e:Dynamic) {
+				#if hl hl.Gc.enable(true); #end
+				throw e;
+			}
+		}
 		else throw new haxe.Exception('Cannot resolve ${service} into a class.');
 	}
 
