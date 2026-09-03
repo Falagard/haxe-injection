@@ -35,6 +35,10 @@ final class ServiceProvider implements Destructable implements Service {
 	**/
 	public static var crossThreadResolutionTimeoutSeconds : Float = 120;
 
+	/** Per-class constructor-arg cache guarded by _argsCacheMutex. See getServiceArgs(). **/
+	private static var _argsCache : StringMap<Array<String>> = new StringMap();
+	private static var _argsCacheMutex : Mutex = new Mutex();
+
 	private var _mutex : Mutex;
 	private var _condition : sys.thread.Condition;
 	private var _lockOwner : Null<sys.thread.Thread> = null;
@@ -427,7 +431,54 @@ final class ServiceProvider implements Destructable implements Service {
 		}
 	}
 
+	/**
+		Constructor argument names for a service class.
+
+		MEMOISED AND SERIALISED, deliberately. The uncached implementation below does two
+		reflective operations -- `Type.createEmptyInstance` and a **dynamic** dispatch of
+		`getConstructorArgs()` -- and on HashLink a dynamic dispatch goes through `hl_dyn_getp`
+		and the process-global field-name hash table guarded by `hl_hash_gen`'s mutex.
+
+		Running that concurrently from many threads is not safe in practice. Observed as a hard
+		SIGSEGV in a real full-suite run (macOS crash report, PID 19656, 2026-09-03 18:21:29):
+
+		    Thread 23 CRASHED: hl_dyn_getp + 121   KERN_INVALID_ADDRESS at 0x8, rax=0
+		    Thread 0:          hl_hash_gen + 583 -> _pthread_mutex_firstfit_unlock_slow
+		    Thread 21:         BLOCKED in hl_mutex_acquire <- hl_hash_gen + 125
+
+		i.e. three threads inside that shared hash machinery at once, one faulting on a near-null
+		pointer. A fault at offset 0x8 from null is a null-dereference signature, NOT the
+		garbage-address signature of GC heap corruption -- so wrapping this in
+		`hl.Gc.enable(false)` does not fix it, and an earlier attempt of mine to do exactly that
+		was treating the wrong cause.
+
+		The result depends only on the class, so computing it once per class and serialising that
+		computation removes the concurrent dynamic dispatch entirely. After warm-up this is a map
+		lookup instead of two reflective calls, which is also a straight performance win on every
+		dependency-tree walk.
+
+		Callers must treat the returned array as read-only -- it is the shared cached instance.
+	**/
 	private function getServiceArgs(service:String) : Array<String> {
+		#if sys _argsCacheMutex.acquire(); #end
+		try {
+			var cached = _argsCache.get(service);
+			if (cached != null) {
+				#if sys _argsCacheMutex.release(); #end
+				return cached;
+			}
+			var computed = computeServiceArgs(service);
+			_argsCache.set(service, computed);
+			#if sys _argsCacheMutex.release(); #end
+			return computed;
+		} catch (e:Dynamic) {
+			// Haxe has no `finally`; never leave the cache mutex held.
+			#if sys _argsCacheMutex.release(); #end
+			throw e;
+		}
+	}
+
+	private function computeServiceArgs(service:String) : Array<String> {
 		var type = Type.resolveClass(service);
 		if (type == null) throw new haxe.Exception('Cannot resolve ${service} into a class.');
 		#if hl hl.Gc.enable(false); #end
@@ -437,20 +488,9 @@ final class ServiceProvider implements Destructable implements Service {
 		
 		try {
 			// This relies on macro-generated metadata or method.
-			//
-			// SERVER-TEST-SUITE-HANG-S1: the GC guard above covered only Type.createEmptyInstance.
-			// getConstructorArgs() is macro-generated and ALLOCATES its Array<String>, so the HL GC
-			// can fire here too -- observed as a real SIGNAL 11 with this exact frame at the top,
-			// on the PreviewExpiryService background thread:
-			//   getServiceArgs -> buildDependencyTree -> handleServiceRequest -> DI.get
-			// Guard the call itself, and re-enable GC on BOTH exits (Haxe has no `finally`, and
-			// leaving the GC disabled after a throw would be far worse than the original crash).
-			#if hl hl.Gc.enable(false); #end
 			var args = (instance.getConstructorArgs() : Array<String>);
-			#if hl hl.Gc.enable(true); #end
 			return args;
 		} catch (e:Dynamic) {
-			#if hl hl.Gc.enable(true); #end
 			return []; // Fallback if no args are defined/meta missing
 		}
 	}
