@@ -436,9 +436,21 @@ final class ServiceProvider implements Destructable implements Service {
 		if (instance == null) throw new haxe.Exception('Cannot create empty instance of ${service}.');
 		
 		try {
-			// This relies on macro-generated metadata or method
-			return (instance.getConstructorArgs() : Array<String>);
+			// This relies on macro-generated metadata or method.
+			//
+			// SERVER-TEST-SUITE-HANG-S1: the GC guard above covered only Type.createEmptyInstance.
+			// getConstructorArgs() is macro-generated and ALLOCATES its Array<String>, so the HL GC
+			// can fire here too -- observed as a real SIGNAL 11 with this exact frame at the top,
+			// on the PreviewExpiryService background thread:
+			//   getServiceArgs -> buildDependencyTree -> handleServiceRequest -> DI.get
+			// Guard the call itself, and re-enable GC on BOTH exits (Haxe has no `finally`, and
+			// leaving the GC disabled after a throw would be far worse than the original crash).
+			#if hl hl.Gc.enable(false); #end
+			var args = (instance.getConstructorArgs() : Array<String>);
+			#if hl hl.Gc.enable(true); #end
+			return args;
 		} catch (e:Dynamic) {
+			#if hl hl.Gc.enable(true); #end
 			return []; // Fallback if no args are defined/meta missing
 		}
 	}
