@@ -20,6 +20,21 @@ final class ServiceProvider implements Destructable implements Service {
 	private var _resolvedScopes : StringMap<Service>;
 
 	#if sys
+	/**
+		Maximum time (seconds) one thread will wait for ANOTHER thread to finish resolving the
+		same implementation before failing with a diagnostic exception.
+
+		Exists so that a resolver thread which dies, is killed, or blocks forever inside a
+		service constructor cannot silently wedge every other thread that needs that service.
+		Before this bound existed the wait was an unconditional `while (true)` retry loop with
+		no deadline and no logging -- a genuine indefinite hang with no diagnostic trail.
+
+		Generous by default: exceeding it means something is actually wrong, not merely slow.
+		Settable so a host with legitimately slow constructors (or a test proving this bound)
+		can adjust it.
+	**/
+	public static var crossThreadResolutionTimeoutSeconds : Float = 120;
+
 	private var _mutex : Mutex;
 	private var _condition : sys.thread.Condition;
 	private var _lockOwner : Null<sys.thread.Thread> = null;
@@ -177,7 +192,10 @@ final class ServiceProvider implements Destructable implements Service {
 
 		#if sys
 		var self = sys.thread.Thread.current();
-		
+		// Set lazily, the first time we actually have to wait on another thread, so the common
+		// (uncontended) path costs nothing.
+		var crossThreadWaitStart:Null<Float> = null;
+
 		_mutex.acquire();
 		while (true) {
 			var implementation = switch (serviceType) {
@@ -200,7 +218,30 @@ final class ServiceProvider implements Destructable implements Service {
 			// Check if it's currently being resolved by another thread
 			var resolver = _resolving.get(implementation);
 			if (resolver != null && resolver != self) {
-				// Wait for it to finish (avoiding deadlocks by releasing mutex and sleeping)
+				// Wait for it to finish (avoiding deadlocks by releasing mutex and sleeping).
+				//
+				// This wait is BOUNDED. It used to be an unconditional `while (true)` retry with
+				// no deadline: if the owning thread never cleared its `_resolving` entry -- it
+				// died, was killed, or blocked indefinitely inside buildDependencyTree (e.g. a
+				// constructor doing I/O) -- every other thread requesting this implementation
+				// span here forever, silently, with no timeout and no diagnostic. That is
+				// indistinguishable from a deadlock to an operator, and it produces no output at
+				// all while background threads keep logging normally, which makes it very
+				// expensive to diagnose after the fact.
+				if (crossThreadWaitStart == null) {
+					crossThreadWaitStart = haxe.Timer.stamp();
+				} else if (haxe.Timer.stamp() - crossThreadWaitStart > crossThreadResolutionTimeoutSeconds) {
+					var waited = Math.round((haxe.Timer.stamp() - crossThreadWaitStart) * 10) / 10;
+					_mutex.release();
+					throw new haxe.Exception(
+						'Timed out after ${waited}s waiting for another thread to finish resolving '
+						+ 'service \'${name}\' (implementation: ${implementation}). '
+						+ 'Waiting thread: ${self}; owning thread: ${resolver}. '
+						+ 'The owning thread registered itself as the resolver and never cleared it, '
+						+ 'which means it died, was killed, or is itself blocked inside that service\'s '
+						+ 'constructor. Raise ServiceProvider.crossThreadResolutionTimeoutSeconds only if '
+						+ 'this service legitimately takes longer than that to construct.');
+				}
 				_mutex.release();
 				Sys.sleep(0.01);
 				_mutex.acquire();
